@@ -1,0 +1,13 @@
+{
+  "id": "com.glam.sysmon",
+  "name": "内存检测",
+  "version": "1.0.0",
+  "api_level": 1,
+  "entry": "app.elf",
+  "category": "tool",
+  "bg_policy": "keep_all",
+  "author": "G'lam Studio",
+  "accent": "#0EA5E9",
+  "description": "G'lam OS 扩展内存与高速缓存实时体检工具",
+  "permissions": ["sandbox_data"]
+}

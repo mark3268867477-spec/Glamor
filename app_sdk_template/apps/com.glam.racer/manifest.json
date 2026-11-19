@@ -1,0 +1,13 @@
+{
+  "id": "com.glam.racer",
+  "name": "极速赛车",
+  "version": "1.0.0",
+  "api_level": 1,
+  "entry": "app.elf",
+  "category": "game",
+  "bg_policy": "kill_all",
+  "author": "G'lam Studio",
+  "accent": "#F97316",
+  "description": "QMI8658 六轴陀螺仪体感极速赛车游戏",
+  "permissions": ["sandbox_data"]
+}

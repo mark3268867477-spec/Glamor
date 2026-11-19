@@ -1,0 +1,13 @@
+{
+  "id": "com.glam.music",
+  "name": "G'lam 音乐",
+  "version": "1.0.0",
+  "api_level": 1,
+  "entry": "app.elf",
+  "category": "media",
+  "bg_policy": "partial_service",
+  "author": "G'lam Studio",
+  "accent": "#E32636",
+  "description": "G'lam OS 原生高清音乐播放器",
+  "permissions": ["audio", "media_read", "sandbox_data"]
+}

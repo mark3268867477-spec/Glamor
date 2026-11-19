@@ -1,0 +1,11 @@
+# Bundled zero-environment binary release artifacts (published via GitHub Releases)
+release/Glamor_Portable/
+release/*.zip
+
+# Python / IDE caches
+__pycache__/
+*.pyc
+*.pyo
+.vscode/
+.DS_Store
+Thumbs.db

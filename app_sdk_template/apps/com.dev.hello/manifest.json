@@ -1,0 +1,16 @@
+{
+  "id": "com.dev.hello",
+  "name": "我的应用",
+  "version": "1.0.0",
+  "api_level": 1,
+  "entry": "app.elf",
+  "category": "tool",
+  "bg_policy": "keep_all",
+  "author": "Developer",
+  "accent": "#0EA5E9",
+  "description": "基于 G'lam OS SDK 开发的动态应用",
+  "permissions": [
+    "sandbox_data"
+  ],
+  "icon": "icon.png"
+}
