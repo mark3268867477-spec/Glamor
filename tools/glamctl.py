@@ -269,6 +269,30 @@ def cmd_gui(_args: argparse.Namespace) -> int:
     return glam_studio.main()
 
 
+def cmd_pc_agent(args: argparse.Namespace) -> int:
+    import time as _time
+    from glam_sdk.pc_agent import ExternalMcpManager, GlamorPcBridge, PcToolExecutor
+
+    def _log(msg: str, _tag: str = "") -> None:
+        print(msg, flush=True)
+
+    ext_mcp = ExternalMcpManager(log_cb=_log)
+    if args.mcp_config and os.path.isfile(args.mcp_config):
+        with open(args.mcp_config, "r", encoding="utf-8") as f:
+            ext_mcp.reload_from_json(f.read())
+
+    executor = PcToolExecutor(ext_mcp=ext_mcp, log_cb=_log)
+    bridge = GlamorPcBridge(executor=executor, on_log=_log)
+    bridge.start(mode=args.mode, port=args.port or "", baud=args.baud, wifi_ip=args.wifi or "")
+    try:
+        while True:
+            _time.sleep(1.0)
+    except KeyboardInterrupt:
+        bridge.stop()
+        ext_mcp.stop_all()
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="glamctl",
@@ -353,6 +377,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_gui = sub.add_parser("gui", help="启动 G'lamor 桌面可视化控制器")
     p_gui.set_defaults(func=cmd_gui)
+
+    p_pca = sub.add_parser("pc-agent", help="启动小智 Windows PC 控制桥接守护进程 (USB 串口 + Wi-Fi 双通道)")
+    p_pca.add_argument("--mode", default="auto", choices=["auto", "serial", "wifi"], help="桥接通道模式")
+    p_pca.add_argument("--port", default="", help="USB 串口号，例如 COM7 (默认自动探测)")
+    p_pca.add_argument("--baud", type=int, default=115200, help="串口波特率 (默认 115200)")
+    p_pca.add_argument("--wifi", default="", help="设备局域网 IP")
+    p_pca.add_argument("--mcp-config", default="", help="外部 mcpServers JSON 配置文件路径")
+    p_pca.set_defaults(func=cmd_pc_agent)
 
     return parser
 

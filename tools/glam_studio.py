@@ -59,6 +59,17 @@ from glam_sdk.transport import (  # noqa: E402
     wifi_list_apps,
     wifi_uninstall_app,
 )
+from glam_sdk.pc_agent import (  # noqa: E402
+    DEFAULT_MCP_SERVERS_JSON,
+    ExternalMcpManager,
+    GlamorPcBridge,
+    PcToolExecutor,
+)
+from glam_sdk.vision_agent import (  # noqa: E402
+    AI_PROVIDER_PRESETS,
+    DEFAULT_AI_AGENT_CONFIG,
+    test_ai_connection,
+)
 
 try:
     from PIL import Image, ImageDraw, ImageOps, ImageTk  # type: ignore
@@ -273,8 +284,52 @@ class GlamStudioApp:
         self.var_dev_sd = tk.StringVar(value="TF 卡: --")
         self.var_auto_shot = tk.BooleanVar(value=False)
 
+        # PC Control Bridge tab variables
+        self.var_pc_mode_label = tk.StringVar(value="自动双通道 (USB + Wi-Fi)")
+        self.var_pc_autostart = tk.BooleanVar(value=bool(self.cfg.get("pc_autostart", False)))
+        self.var_pc_status = tk.StringVar(value="未启动")
+        self.var_perm_app = tk.BooleanVar(value=bool(self.cfg.get("perm_app", True)))
+        self.var_perm_input = tk.BooleanVar(value=bool(self.cfg.get("perm_input", True)))
+        self.var_perm_file = tk.BooleanVar(value=bool(self.cfg.get("perm_file", True)))
+        self.var_perm_shell = tk.BooleanVar(value=bool(self.cfg.get("perm_shell", True)))
+        self._ext_mcp_json = str(self.cfg.get("mcp_servers_json") or DEFAULT_MCP_SERVERS_JSON)
+        self._pc_event_details: Dict[str, str] = {}
+
+        ai_cfg = dict(DEFAULT_AI_AGENT_CONFIG)
+        if isinstance(self.cfg.get("ai_agent_cfg"), dict):
+            ai_cfg.update(self.cfg["ai_agent_cfg"])
+        self.var_ai_preset = tk.StringVar(value=str(ai_cfg.get("preset") or DEFAULT_AI_AGENT_CONFIG["preset"]))
+        self.var_ai_format = tk.StringVar(value=str(ai_cfg.get("api_format") or "openai"))
+        self.var_ai_base_url = tk.StringVar(value=str(ai_cfg.get("base_url") or DEFAULT_AI_AGENT_CONFIG["base_url"]))
+        self.var_ai_key = tk.StringVar(value=str(ai_cfg.get("api_key") or ""))
+        self.var_ai_model = tk.StringVar(value=str(ai_cfg.get("model") or DEFAULT_AI_AGENT_CONFIG["model"]))
+        self.var_ai_vision = tk.BooleanVar(value=bool(ai_cfg.get("use_vision", True)))
+        self.var_ai_steps = tk.IntVar(value=int(ai_cfg.get("max_steps") or 8))
+
+        self.ext_mcp = ExternalMcpManager(log_cb=self._log)
+        self.pc_executor = PcToolExecutor(
+            ext_mcp=self.ext_mcp,
+            log_cb=self._log,
+            on_perm_mode=lambda m: self.root.after(0, lambda pm=m: self._on_device_perm_mode(pm)),
+        )
+        self.pc_bridge = GlamorPcBridge(
+            executor=self.pc_executor,
+            on_log=self._log,
+            on_event=lambda ev: self.root.after(0, lambda e=ev: self._on_pc_bridge_event(e)),
+            on_status=lambda text, active: self.root.after(0, lambda t=text, a=active: self._on_pc_bridge_status(t, a)),
+        )
+        saved_mode = self.cfg.get("pc_mode", "auto")
+        mode_labels = {
+            "auto": "自动双通道 (USB + Wi-Fi)",
+            "serial": "仅 USB 串口",
+            "wifi": "仅 Wi-Fi 局域网",
+        }
+        if saved_mode in mode_labels:
+            self.var_pc_mode_label.set(mode_labels[saved_mode])
+
         self._setup_styles()
         self._build_layout()
+        self._sync_pc_permissions()
         self._refresh_gcc_badge()
         self._refresh_ports_and_drives()
 
@@ -290,6 +345,8 @@ class GlamStudioApp:
             self._inspect_pkg_path(self.var_inst_pkg.get())
 
         self.root.after(100, self._drain_log_queue)
+        if self.var_pc_autostart.get():
+            self.root.after(450, self._start_pc_bridge)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _apply_window_icon(self) -> None:
@@ -324,7 +381,18 @@ class GlamStudioApp:
                 pass
         return {}
 
+    def _pc_mode_key(self) -> str:
+        lbl = self.var_pc_mode_label.get()
+        if "USB" in lbl and "Wi-Fi" not in lbl:
+            return "serial"
+        if "Wi-Fi" in lbl and "USB" not in lbl:
+            return "wifi"
+        return "auto"
+
     def _save_config(self) -> None:
+        mcp_txt = self._ext_mcp_json
+        if hasattr(self, "txt_mcp_cfg"):
+            mcp_txt = self.txt_mcp_cfg.get("1.0", "end").strip() or DEFAULT_MCP_SERVERS_JSON
         data = {
             "gcc_path": self.var_gcc.get().strip(),
             "last_project": self.var_project_dir.get().strip(),
@@ -332,6 +400,14 @@ class GlamStudioApp:
             "wifi_ip": self.var_wifi_ip.get().strip(),
             "serial_port": self.var_serial_port.get().strip(),
             "sd_drive": self.var_sd_drive.get().strip(),
+            "pc_mode": self._pc_mode_key(),
+            "pc_autostart": bool(self.var_pc_autostart.get()),
+            "perm_app": bool(self.var_perm_app.get()),
+            "perm_input": bool(self.var_perm_input.get()),
+            "perm_file": bool(self.var_perm_file.get()),
+            "perm_shell": bool(self.var_perm_shell.get()),
+            "mcp_servers_json": mcp_txt,
+            "ai_agent_cfg": self._collect_ai_agent_cfg(),
         }
         try:
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -345,6 +421,11 @@ class GlamStudioApp:
                 self.root.after_cancel(self._auto_shot_job)
             except Exception:
                 pass
+        try:
+            self.pc_bridge.stop()
+            self.ext_mcp.stop_all()
+        except Exception:
+            pass
         self._save_config()
         self.root.destroy()
 
@@ -562,14 +643,17 @@ class GlamStudioApp:
         self.tab_build = ttk.Frame(self.notebook, style="Main.TFrame", padding=(0, 8, 0, 0))
         self.tab_install = ttk.Frame(self.notebook, style="Main.TFrame", padding=(0, 8, 0, 0))
         self.tab_device = ttk.Frame(self.notebook, style="Main.TFrame", padding=(0, 8, 0, 0))
+        self.tab_pc = ttk.Frame(self.notebook, style="Main.TFrame", padding=(0, 8, 0, 0))
 
         self.notebook.add(self.tab_build, text="  1. 构建 & 打包 (.gla)  ")
         self.notebook.add(self.tab_install, text="  2. 安装到设备  ")
         self.notebook.add(self.tab_device, text="  3. 设备管理 & 实时投屏  ")
+        self.notebook.add(self.tab_pc, text="  4. 小智 PC 控制 (MCP 桥接)  ")
 
         self._build_tab_build()
         self._build_tab_install()
         self._build_tab_device()
+        self._build_tab_pc()
 
         # Bottom Console
         bot_wrap = tk.Frame(paned, bg=BG_CARD, highlightbackground=BORDER_SUBTLE, highlightthickness=1)
@@ -1015,6 +1099,293 @@ class GlamStudioApp:
         ).pack(side="left", padx=(0, 10))
         ttk.Button(sbtns, text="保存截图...", command=self._save_screenshot_file, style="Secondary.TButton").pack(
             side="right"
+        )
+
+    def _build_tab_pc(self) -> None:
+        self.tab_pc.columnconfigure(0, weight=5)
+        self.tab_pc.columnconfigure(1, weight=6)
+        self.tab_pc.rowconfigure(1, weight=1)
+
+        # Top Connection & Control Bar
+        top_outer, top = self._card(self.tab_pc, "")
+        top_outer.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+
+        bar = ttk.Frame(top, style="Card.TFrame")
+        bar.pack(fill="x")
+
+        self.lbl_pc_badge = tk.Label(
+            bar,
+            text=" 已停止 ",
+            bg="#1E293B",
+            fg=TEXT_SEC,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            padx=8,
+            pady=3,
+        )
+        self.lbl_pc_badge.pack(side="left", padx=(0, 8))
+
+        ttk.Label(bar, text="通道:", style="Field.TLabel").pack(side="left")
+        cb_mode = ttk.Combobox(
+            bar,
+            textvariable=self.var_pc_mode_label,
+            values=["自动双通道 (USB + Wi-Fi)", "仅 USB 串口", "仅 Wi-Fi 局域网"],
+            state="readonly",
+            width=21,
+        )
+        cb_mode.pack(side="left", padx=(4, 10))
+
+        ttk.Label(bar, text="USB 串口:", style="Field.TLabel").pack(side="left")
+        self.cb_pc_ports = ttk.Combobox(bar, textvariable=self.var_serial_port, width=10)
+        self.cb_pc_ports.pack(side="left", padx=(4, 8))
+
+        ttk.Label(bar, text="设备 IP:", style="Field.TLabel").pack(side="left")
+        ttk.Entry(bar, textvariable=self.var_wifi_ip, width=14).pack(side="left", padx=(4, 8))
+
+        ttk.Button(bar, text="刷新串口", command=self._refresh_ports_and_drives, style="Secondary.TButton").pack(
+            side="left", padx=(0, 8)
+        )
+
+        self.btn_pc_toggle = ttk.Button(
+            bar, text="启动 PC 控制桥接", command=self._toggle_pc_bridge, style="Accent.TButton"
+        )
+        self.btn_pc_toggle.pack(side="left", padx=(0, 10))
+
+        ttk.Checkbutton(bar, text="自启动", variable=self.var_pc_autostart, command=self._save_config).pack(
+            side="left"
+        )
+
+        # Left Column: Permissions + Self-Test + External MCP Config
+        left_wrap = ttk.Frame(self.tab_pc, style="Main.TFrame")
+        left_wrap.grid(row=1, column=0, sticky="nsew", padx=(0, 6))
+        left_wrap.columnconfigure(0, weight=1)
+        left_wrap.rowconfigure(1, weight=1)
+
+        perm_outer, perm = self._card(left_wrap, "安全权限开关与本机快捷自测")
+        perm_outer.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+
+        ttk.Checkbutton(
+            perm,
+            text="应用与浏览器控制（打开/关闭/切换软件、打开网页、B站/百度/必应/GitHub 搜索）",
+            variable=self.var_perm_app,
+            command=self._sync_pc_permissions,
+        ).pack(anchor="w", pady=2)
+        ttk.Checkbutton(
+            perm,
+            text="键鼠模拟与系统多媒体（快捷键、中英文打字输入、音量调节、截屏、锁屏）",
+            variable=self.var_perm_input,
+            command=self._sync_pc_permissions,
+        ).pack(anchor="w", pady=2)
+        ttk.Checkbutton(
+            perm,
+            text="文件浏览与剪贴板读写（打开目录、搜索文件、读写文本文件、读取/写入剪贴板）",
+            variable=self.var_perm_file,
+            command=self._sync_pc_permissions,
+        ).pack(anchor="w", pady=2)
+        ttk.Checkbutton(
+            perm,
+            text="PowerShell 终端与外部标准 MCP 挂载（允许执行命令与调用外部 mcpServers）",
+            variable=self.var_perm_shell,
+            command=self._sync_pc_permissions,
+        ).pack(anchor="w", pady=2)
+
+        trow = ttk.Frame(perm, style="Card.TFrame")
+        trow.pack(fill="x", pady=(8, 0))
+        ttk.Label(trow, text="本机自测:", style="Field.TLabel").pack(side="left", padx=(0, 6))
+        ttk.Button(
+            trow, text="获取电脑状态", command=lambda: self._run_pc_self_test("pc.get_status", {}), style="Secondary.TButton"
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            trow,
+            text="列出打开窗口",
+            command=lambda: self._run_pc_self_test("pc.app.control", {"action": "list_windows"}),
+            style="Secondary.TButton",
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            trow,
+            text="B站搜 ESP32",
+            command=lambda: self._run_pc_self_test(
+                "pc.browser.control", {"action": "search", "engine": "bilibili", "target": "ESP32"}
+            ),
+            style="Secondary.TButton",
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            trow,
+            text="打开计算器",
+            command=lambda: self._run_pc_self_test("pc.app.control", {"action": "open", "target": "计算器"}),
+            style="Secondary.TButton",
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            trow,
+            text="UIA 控件树",
+            command=lambda: self._run_pc_self_test("pc.control", {"action": "inspect_ui"}),
+            style="Secondary.TButton",
+        ).pack(side="left", padx=3)
+
+        # Bottom Left Notebook: AI Computer Use (BYOK) + External MCP Server Mount
+        left_nb = ttk.Notebook(left_wrap)
+        left_nb.grid(row=1, column=0, sticky="nsew")
+
+        ai_tab = ttk.Frame(left_nb, style="Card.TFrame", padding=10)
+        mcp_tab = ttk.Frame(left_nb, style="Card.TFrame", padding=10)
+        left_nb.add(ai_tab, text=" 本地 AI 视觉代理 (BYOK: OpenAI / Anthropic) ")
+        left_nb.add(mcp_tab, text=" 外部 MCP 挂载 (mcpServers JSON) ")
+
+        ai_hdr = ttk.Frame(ai_tab, style="Card.TFrame")
+        ai_hdr.pack(fill="x", pady=(0, 6))
+        ttk.Label(ai_hdr, text="模型预设:", style="Field.TLabel").pack(side="left")
+        cb_preset = ttk.Combobox(
+            ai_hdr,
+            textvariable=self.var_ai_preset,
+            values=list(AI_PROVIDER_PRESETS.keys()),
+            state="readonly",
+            width=26,
+        )
+        cb_preset.pack(side="left", padx=(4, 10))
+        cb_preset.bind("<<ComboboxSelected>>", self._on_ai_preset_selected)
+
+        ttk.Label(ai_hdr, text="协议:", style="Field.TLabel").pack(side="left")
+        ttk.Combobox(
+            ai_hdr,
+            textvariable=self.var_ai_format,
+            values=["openai", "anthropic"],
+            state="readonly",
+            width=10,
+        ).pack(side="left", padx=(4, 10))
+
+        ttk.Label(ai_hdr, text="步数:", style="Field.TLabel").pack(side="left")
+        ttk.Spinbox(ai_hdr, from_=1, to=15, textvariable=self.var_ai_steps, width=4).pack(side="left", padx=(4, 0))
+
+        ai_row1 = ttk.Frame(ai_tab, style="Card.TFrame")
+        ai_row1.pack(fill="x", pady=3)
+        ttk.Label(ai_row1, text="Base URL:", style="Field.TLabel", width=10).pack(side="left")
+        ttk.Entry(ai_row1, textvariable=self.var_ai_base_url).pack(side="left", fill="x", expand=True)
+
+        ai_row2 = ttk.Frame(ai_tab, style="Card.TFrame")
+        ai_row2.pack(fill="x", pady=3)
+        ttk.Label(ai_row2, text="API Key:", style="Field.TLabel", width=10).pack(side="left")
+        ttk.Entry(ai_row2, textvariable=self.var_ai_key, show="*").pack(side="left", fill="x", expand=True)
+
+        ai_row3 = ttk.Frame(ai_tab, style="Card.TFrame")
+        ai_row3.pack(fill="x", pady=3)
+        ttk.Label(ai_row3, text="Model:", style="Field.TLabel", width=10).pack(side="left")
+        ttk.Entry(ai_row3, textvariable=self.var_ai_model, width=22).pack(side="left", padx=(0, 10))
+        ttk.Checkbutton(
+            ai_row3,
+            text="发送 SoM 标注截图 (多模态视觉)",
+            variable=self.var_ai_vision,
+            command=self._save_ai_agent_cfg,
+        ).pack(side="left")
+
+        ai_row4 = ttk.Frame(ai_tab, style="Card.TFrame")
+        ai_row4.pack(fill="x", pady=(8, 4))
+        ttk.Button(ai_row4, text="保存 AI 配置", command=self._save_ai_agent_cfg, style="Accent.TButton").pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(ai_row4, text="测试 API 连通", command=self._test_ai_agent_conn, style="Secondary.TButton").pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(ai_row4, text="紧急停止 AI 任务", command=self._emergency_stop_ai_task, style="Danger.TButton").pack(
+            side="left", padx=(0, 8)
+        )
+        self.lbl_dev_perm = tk.Label(
+            ai_row4,
+            text="小智权限: 部分访问",
+            bg="#0F3A3D",
+            fg="#5EEAD4",
+            font=("Microsoft YaHei UI", 8, "bold"),
+            padx=8,
+            pady=3,
+        )
+        self.lbl_dev_perm.pack(side="right")
+
+        ttk.Label(
+            ai_tab,
+            text="提示: DeepSeek 填 deepseek-flash 可原生看图 + UIA 双模态闭环；将鼠标迅速甩到屏幕左上角可随时急停。",
+            style="Muted.TLabel",
+            wraplength=540,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+
+        mcp = mcp_tab
+        mcp_box = tk.Frame(mcp, bg="#080E1C", highlightbackground=BORDER_SUBTLE, highlightthickness=1)
+        mcp_box.pack(fill="both", expand=True, pady=(0, 8))
+        self.txt_mcp_cfg = tk.Text(
+            mcp_box,
+            height=7,
+            bg="#080E1C",
+            fg=TEXT_PRI,
+            insertbackground=TEXT_PRI,
+            relief="flat",
+            font=("Consolas", 9),
+            wrap="none",
+            padx=8,
+            pady=6,
+        )
+        mcp_sb = ttk.Scrollbar(mcp_box, orient="vertical", command=self.txt_mcp_cfg.yview)
+        self.txt_mcp_cfg.configure(yscrollcommand=mcp_sb.set)
+        mcp_sb.pack(side="right", fill="y")
+        self.txt_mcp_cfg.pack(side="left", fill="both", expand=True)
+        self.txt_mcp_cfg.insert("1.0", self._ext_mcp_json)
+
+        mbtns = ttk.Frame(mcp, style="Card.TFrame")
+        mbtns.pack(fill="x")
+        ttk.Button(mbtns, text="保存并重载外部 MCP", command=self._reload_ext_mcp, style="Accent.TButton").pack(
+            side="left", padx=(0, 8)
+        )
+        ttk.Button(mbtns, text="查看已挂载工具", command=self._show_ext_mcp_tools, style="Secondary.TButton").pack(
+            side="left", padx=(0, 8)
+        )
+        ttk.Button(mbtns, text="恢复模板", command=self._reset_ext_mcp_template, style="Secondary.TButton").pack(
+            side="right"
+        )
+
+        # Right Column: Live XiaoZhi MCP Call Monitor & Voice Prompt Guide
+        right_outer, right = self._card(self.tab_pc, "小智 PC MCP 实时指令监控 & 语音口令指南")
+        right_outer.grid(row=1, column=1, sticky="nsew", padx=(6, 0))
+
+        cols = ("time", "channel", "tool", "args", "status")
+        self.tree_pc_events = ttk.Treeview(right, columns=cols, show="headings", selectmode="browse", height=9)
+        self.tree_pc_events.heading("time", text="时间")
+        self.tree_pc_events.heading("channel", text="通道")
+        self.tree_pc_events.heading("tool", text="MCP 工具")
+        self.tree_pc_events.heading("args", text="调用参数")
+        self.tree_pc_events.heading("status", text="状态")
+        self.tree_pc_events.column("time", width=66, anchor="center")
+        self.tree_pc_events.column("channel", width=58, anchor="center")
+        self.tree_pc_events.column("tool", width=130)
+        self.tree_pc_events.column("args", width=190)
+        self.tree_pc_events.column("status", width=85, anchor="center")
+        self.tree_pc_events.pack(fill="both", expand=True, pady=(0, 6))
+        self.tree_pc_events.bind("<<TreeviewSelect>>", self._on_pc_event_selected)
+
+        det_hdr = ttk.Frame(right, style="Card.TFrame")
+        det_hdr.pack(fill="x", pady=(0, 4))
+        ttk.Label(det_hdr, text="选中指令返回详情 / 常用小智语音口令:", style="Field.TLabel").pack(side="left")
+        ttk.Button(det_hdr, text="清空记录", command=self._clear_pc_events, style="Secondary.TButton").pack(
+            side="right"
+        )
+
+        det_box = tk.Frame(right, bg="#080E1C", highlightbackground=BORDER_SUBTLE, highlightthickness=1)
+        det_box.pack(fill="x")
+        self.txt_pc_detail = tk.Text(
+            det_box,
+            height=6,
+            bg="#080E1C",
+            fg="#CBD5E1",
+            relief="flat",
+            font=("Consolas", 9),
+            wrap="word",
+            padx=8,
+            pady=6,
+        )
+        self.txt_pc_detail.pack(fill="x")
+        self._set_pc_detail_text(
+            "💡 唤醒 G'lam OS 上的「你好小智」后，可直接说出以下电脑控制指令：\n"
+            "  • “帮我在电脑上打开B站搜索 ESP32 教程”  (pc.control: search_web)\n"
+            "  • “看看我电脑当前窗口上都有什么按钮 / 点一下发送”  (inspect_ui / click_element)\n"
+            "  • “在微信里帮我看看有没有新消息 / 帮我用AI点击网页里的下载”  (auto_task 本地视觉闭环)\n"
+            "  • “把电脑音量调到 30 / 电脑截个屏 / 把电脑锁屏”  (set_volume / screenshot / lock_screen)\n"
+            "  • 在小智设备端「设置」可随时切换电脑控制权限：完全权限 / 部分访问 / 每次都问。"
         )
 
     # ------------------------------------------------------------------
@@ -1558,6 +1929,8 @@ class GlamStudioApp:
         ports = list_serial_ports()
         port_vals = [p["device"] for p in ports]
         self.cb_ports.configure(values=port_vals)
+        if hasattr(self, "cb_pc_ports"):
+            self.cb_pc_ports.configure(values=port_vals)
         if port_vals and self.var_serial_port.get().strip() not in port_vals:
             self.var_serial_port.set(port_vals[0])
 
@@ -1627,14 +2000,18 @@ class GlamStudioApp:
             )
 
         def task() -> None:
-            info = install_via_serial(
-                port,
-                pkg,
-                baud=baud,
-                force_legacy_proto=legacy,
-                progress_cb=on_prog,
-                log_cb=lambda m: self._log(m),
-            )
+            self.pc_bridge.pause_serial_for_flash()
+            try:
+                info = install_via_serial(
+                    port,
+                    pkg,
+                    baud=baud,
+                    force_legacy_proto=legacy,
+                    progress_cb=on_prog,
+                    log_cb=lambda m: self._log(m),
+                )
+            finally:
+                self.pc_bridge.resume_serial_after_flash()
             self.root.after(0, lambda: self._on_install_done(f"USB 安装成功: {info['id']} (已写 TF 卡)"))
 
         self._run_bg(task)
@@ -1795,6 +2172,223 @@ class GlamStudioApp:
             with open(p, "wb") as f:
                 f.write(self._last_bmp_bytes)
         self._log(f"截图已保存: {p}", "ok")
+
+    # ------------------------------------------------------------------
+    # XiaoZhi PC Control Bridge (Tab 4)
+    # ------------------------------------------------------------------
+
+    def _collect_ai_agent_cfg(self) -> Dict[str, Any]:
+        try:
+            steps = max(1, min(15, int(self.var_ai_steps.get())))
+        except Exception:
+            steps = 8
+        return {
+            "preset": self.var_ai_preset.get().strip(),
+            "api_format": self.var_ai_format.get().strip() or "openai",
+            "base_url": self.var_ai_base_url.get().strip(),
+            "api_key": self.var_ai_key.get().strip(),
+            "model": self.var_ai_model.get().strip(),
+            "use_vision": bool(self.var_ai_vision.get()),
+            "max_steps": steps,
+        }
+
+    def _on_ai_preset_selected(self, _e=None) -> None:
+        name = self.var_ai_preset.get()
+        preset = AI_PROVIDER_PRESETS.get(name, {})
+        if preset:
+            self.var_ai_format.set(str(preset.get("api_format", "openai")))
+            self.var_ai_base_url.set(str(preset.get("base_url", "")))
+            self.var_ai_model.set(str(preset.get("model", "")))
+            self.var_ai_vision.set(bool(preset.get("use_vision", True)))
+        self._save_ai_agent_cfg()
+
+    def _save_ai_agent_cfg(self) -> None:
+        cfg = self._collect_ai_agent_cfg()
+        self.pc_executor.set_ai_agent_config(cfg)
+        self._save_config()
+
+    def _test_ai_agent_conn(self) -> None:
+        self._save_ai_agent_cfg()
+        cfg = self._collect_ai_agent_cfg()
+
+        def task() -> None:
+            ok, msg = test_ai_connection(cfg)
+            self._log(f"[AI代理连通测试] {msg}", "ok" if ok else "err")
+            self.root.after(0, lambda m=msg, s=ok: self._set_pc_detail_text(m))
+
+        self._run_bg(task)
+
+    def _emergency_stop_ai_task(self) -> None:
+        self.pc_executor.request_cancel()
+        self._log("[AI代理] 已触发手动紧急停止", "warn")
+
+    def _on_device_perm_mode(self, mode: str) -> None:
+        if not hasattr(self, "lbl_dev_perm"):
+            return
+        styles = {
+            "full": ("小智权限: 完全权限", "#451A03", "#FBBF24"),
+            "partial": ("小智权限: 部分访问", "#0F3A3D", "#5EEAD4"),
+            "ask_every": ("小智权限: 每次都问", "#172554", "#60A5FA"),
+        }
+        txt, bg, fg = styles.get(mode, styles["partial"])
+        self.lbl_dev_perm.configure(text=txt, bg=bg, fg=fg)
+
+    def _sync_pc_permissions(self) -> None:
+        self.pc_executor.set_permissions(
+            app_browser=bool(self.var_perm_app.get()),
+            input_system=bool(self.var_perm_input.get()),
+            file_clipboard=bool(self.var_perm_file.get()),
+            shell_mcp=bool(self.var_perm_shell.get()),
+        )
+        self.pc_executor.set_ai_agent_config(self._collect_ai_agent_cfg())
+        self._save_config()
+
+    def _toggle_pc_bridge(self) -> None:
+        if self.pc_bridge.is_running():
+            self.pc_bridge.stop()
+        else:
+            self._start_pc_bridge()
+
+    def _start_pc_bridge(self) -> None:
+        self._sync_pc_permissions()
+        mode = self._pc_mode_key()
+        port = self.var_serial_port.get().strip()
+        ip = self.var_wifi_ip.get().strip()
+        try:
+            baud = int(self.var_serial_baud.get().strip() or "115200")
+        except ValueError:
+            baud = 115200
+
+        # Auto-load external MCP servers if configured
+        mcp_txt = self.txt_mcp_cfg.get("1.0", "end").strip() if hasattr(self, "txt_mcp_cfg") else self._ext_mcp_json
+        if mcp_txt:
+            try:
+                cfg_obj = json.loads(mcp_txt)
+                srvs = cfg_obj.get("mcpServers", {}) if isinstance(cfg_obj, dict) else {}
+                if srvs and not self.ext_mcp.list_all_tools():
+                    self._run_bg(lambda t=mcp_txt: self.ext_mcp.reload_from_json(t))
+            except Exception:
+                pass
+
+        self.pc_bridge.start(mode=mode, port=port, baud=baud, wifi_ip=ip)
+        self._save_config()
+
+    def _on_pc_bridge_status(self, text: str, active: bool) -> None:
+        self.var_pc_status.set(text)
+        if active:
+            has_conn = ("USB(" in text) or ("Wi-Fi(" in text)
+            self.lbl_pc_badge.configure(
+                text=f" {text} ",
+                bg=OK_BG if has_conn else WARN_BG,
+                fg=OK_FG if has_conn else WARN_FG,
+            )
+            self.btn_pc_toggle.configure(text="停止 PC 控制桥接", style="Danger.TButton")
+        else:
+            self.lbl_pc_badge.configure(text=" 已停止 ", bg="#1E293B", fg=TEXT_SEC)
+            self.btn_pc_toggle.configure(text="启动 PC 控制桥接", style="Accent.TButton")
+
+    def _on_pc_bridge_event(self, ev: Dict[str, Any]) -> None:
+        status_str = f"✓ {ev['elapsed_ms']}ms" if ev.get("ok") else f"✗ {ev['elapsed_ms']}ms"
+        iid = self.tree_pc_events.insert(
+            "",
+            0,
+            values=(
+                ev.get("time", ""),
+                ev.get("channel", ""),
+                ev.get("tool", ""),
+                str(ev.get("args", ""))[:80],
+                status_str,
+            ),
+        )
+        detail = (
+            f"[{ev.get('time')}] 通道: {ev.get('channel')}  |  工具: {ev.get('tool')}  |  "
+            f"状态: {'成功' if ev.get('ok') else '失败'} ({ev.get('elapsed_ms')} ms)\n"
+            f"参数: {ev.get('args')}\n"
+            f"返回结果:\n{ev.get('result')}"
+        )
+        self._pc_event_details[iid] = detail
+        self._set_pc_detail_text(detail)
+
+    def _on_pc_event_selected(self, _e=None) -> None:
+        sel = self.tree_pc_events.selection()
+        if not sel:
+            return
+        detail = self._pc_event_details.get(sel[0])
+        if detail:
+            self._set_pc_detail_text(detail)
+
+    def _clear_pc_events(self) -> None:
+        for item in self.tree_pc_events.get_children():
+            self.tree_pc_events.delete(item)
+        self._pc_event_details.clear()
+
+    def _set_pc_detail_text(self, text: str) -> None:
+        self.txt_pc_detail.configure(state="normal")
+        self.txt_pc_detail.delete("1.0", "end")
+        self.txt_pc_detail.insert("1.0", text)
+        self.txt_pc_detail.configure(state="disabled")
+
+    def _run_pc_self_test(self, tool_name: str, args: Dict[str, Any]) -> None:
+        self._sync_pc_permissions()
+
+        def task() -> None:
+            t0 = time.monotonic()
+            ok, res = self.pc_executor.execute(tool_name, args, bypass_confirm=True)
+            ms = int((time.monotonic() - t0) * 1000)
+            ev = {
+                "time": time.strftime("%H:%M:%S"),
+                "channel": "本机自测",
+                "id": 0,
+                "tool": tool_name,
+                "args": json.dumps(args, ensure_ascii=False),
+                "ok": ok,
+                "result": res,
+                "elapsed_ms": ms,
+            }
+            self._log(f"[本机自测] {tool_name} -> {'OK' if ok else 'ERR'} ({ms}ms)", "ok" if ok else "err")
+            self.root.after(0, lambda e=ev: self._on_pc_bridge_event(e))
+
+        self._run_bg(task)
+
+    def _reload_ext_mcp(self) -> None:
+        raw = self.txt_mcp_cfg.get("1.0", "end").strip()
+        try:
+            json.loads(raw or "{}")
+        except Exception as exc:
+            messagebox.showerror("JSON 格式错误", f"mcpServers 配置不是合法的 JSON:\n{exc}", parent=self.root)
+            return
+        self._ext_mcp_json = raw
+        self._save_config()
+
+        def task() -> None:
+            res = self.ext_mcp.reload_from_json(raw)
+            tools = self.ext_mcp.list_all_tools()
+            summary = f"已加载外部 MCP 服务: {len(res['loaded'])} 个，共挂载 {len(tools)} 个外部工具。"
+            if res["errors"]:
+                summary += "\n失败项: " + "; ".join(f"{k}: {v}" for k, v in res["errors"].items())
+            self.root.after(0, lambda s=summary: self._set_pc_detail_text(s))
+
+        self._run_bg(task)
+
+    def _show_ext_mcp_tools(self) -> None:
+        tools = self.ext_mcp.list_all_tools()
+        if not tools:
+            self._set_pc_detail_text(
+                "当前未挂载外部 MCP 工具。\n"
+                "可在左侧编辑 mcpServers JSON（格式同 Claude Desktop / Cursor），然后点击「保存并重载外部 MCP」。\n"
+                "注：即使不挂载外部 MCP，内置的 8 大类 Windows 原生工具（应用/浏览器/键鼠/系统/文件/剪贴板/PowerShell）也随时可用！"
+            )
+            return
+        lines = [f"当前已挂载外部 MCP 工具 ({len(tools)} 个):"]
+        for t in tools:
+            lines.append(f"  • {t['full_name']} — {t['description']}")
+        self._set_pc_detail_text("\n".join(lines))
+
+    def _reset_ext_mcp_template(self) -> None:
+        self.txt_mcp_cfg.delete("1.0", "end")
+        self.txt_mcp_cfg.insert("1.0", DEFAULT_MCP_SERVERS_JSON)
+        self._ext_mcp_json = DEFAULT_MCP_SERVERS_JSON
+        self._save_config()
 
 
 def main() -> int:
