@@ -29,6 +29,52 @@ def _is_sldworks_running() -> bool:
         return False
 
 
+def _launch_solidworks_app() -> bool:
+    """Launch SolidWorks GUI via shortcut or default paths if not already running."""
+    if _is_sldworks_running():
+        return True
+    candidates = [
+        r"D:\solidworks\SOLIDWORKS\SLDWORKS.exe",
+        os.path.expanduser(r"~\Desktop\Solidworks家族\SOLIDWORKS 2025.lnk"),
+        r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\SOLIDWORKS 2025\SOLIDWORKS 2025.lnk",
+        r"C:\Program Files\SOLIDWORKS Corp\SOLIDWORKS\SLDWORKS.exe",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            try:
+                if c.lower().endswith(".exe"):
+                    subprocess.Popen([c], close_fds=True)
+                else:
+                    os.startfile(c)
+                for _ in range(25):
+                    time.sleep(0.5)
+                    if _is_sldworks_running():
+                        return True
+                return True
+            except Exception:
+                pass
+    return False
+
+
+def _clean_args(args: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize XML parameter serialization from certain LLM/proxy function calls."""
+    cleaned = dict(args or {})
+    act = str(cleaned.get("action") or "get_status").strip()
+    if "<arg_key>" in act or "<arg_value>" in act:
+        parts = re.split(r"<arg_key>", act)
+        cleaned["action"] = parts[0].strip()
+        for p in parts[1:]:
+            m = re.match(r"([^<]+)</arg_key>\s*<arg_value>([^<]*)", p)
+            if m:
+                k, v = m.group(1).strip(), m.group(2).strip()
+                if k not in cleaned or not cleaned[k]:
+                    cleaned[k] = v
+    for k, v in list(cleaned.items()):
+        if isinstance(v, str) and ("<arg_key>" in v or "</arg_key>" in v):
+            cleaned[k] = re.sub(r"</?[a-zA-Z0-9_]+>", "", v).strip()
+    return cleaned
+
+
 _COMMON_VBS_HELPERS = r'''
 Function ConnectSolidWorks(createIfMissing, waitIfBooting)
     Dim app, i, maxTries, rev, doneBoot
@@ -63,6 +109,7 @@ Function ConnectSolidWorks(createIfMissing, waitIfBooting)
         End If
         If Not (app Is Nothing) Then
             app.Visible = True
+            app.UserControl = True
             For i = 1 To 40
                 doneBoot = False
                 doneBoot = app.StartupProcessCompleted
@@ -80,6 +127,7 @@ Function ConnectSolidWorks(createIfMissing, waitIfBooting)
     If Not (app Is Nothing) Then
         On Error Resume Next
         app.Visible = True
+        app.UserControl = True
         On Error GoTo 0
     End If
     Set ConnectSolidWorks = app
@@ -145,7 +193,7 @@ End If
         if sw_proc_up:
             vbs = _COMMON_VBS_HELPERS + r'''
 Dim swApp, doc, title, dtype
-Set swApp = ConnectSolidWorks(False, False)
+Set swApp = ConnectSolidWorks(False, True)
 If swApp Is Nothing Then
     WScript.Echo "OK:SolidWorks 正在后台启动加载中，请稍候几秒再试或直接发建模指令等待就绪。"
     WScript.Quit 0
@@ -263,7 +311,7 @@ WScript.Echo "OK:已在 SolidWorks 创建圆柱 直径{diam:g}mm x 高{height:g}
 
     if act == "create_tube":
         od = float(args.get("od") or 50.0)
-        idv = float(args.get("id") or 30.0)
+        idv = float(args.get("inner_dia") or args.get("id") or 30.0)
         height = float(args.get("height") or 20.0)
         if idv >= od:
             raise ValueError(f"管件内径({idv}mm)必须小于外径({od}mm)")
@@ -374,14 +422,16 @@ WScript.Echo "OK:Saved {tmp_vbs_path}"
     raise ValueError(f"不支持的 SolidWorks action: {act}")
 
 
-def run_vbs_text(vbs_code: str, timeout: float = 22.0) -> str:
-    """Write VBScript as GBK/ANSI and execute cleanly via cscript.exe //nologo."""
+def run_vbs_text(vbs_code: str, timeout: float = 35.0) -> str:
+    """Write VBScript as clean UTF-16LE with BOM and execute cleanly via cscript.exe //nologo."""
     if os.name != "nt":
         raise RuntimeError("SolidWorks COM 仅支持 Windows")
     tmp_vbs = ""
+    cleaned_vbs = (vbs_code or "").replace("\ufeff", "").replace("\u200b", "").replace("\u00a0", " ")
+    cleaned_vbs = cleaned_vbs.lstrip("\r\n \t")
     try:
-        with tempfile.NamedTemporaryFile("w", suffix=".vbs", encoding="gbk", errors="replace", delete=False) as tf:
-            tf.write(vbs_code)
+        with tempfile.NamedTemporaryFile("w", suffix=".vbs", encoding="utf-16", delete=False) as tf:
+            tf.write(cleaned_vbs)
             tmp_vbs = tf.name
         kwargs: Dict[str, Any] = {
             "capture_output": True,
@@ -393,7 +443,7 @@ def run_vbs_text(vbs_code: str, timeout: float = 22.0) -> str:
         err_raw = proc.stderr or b""
         out = ""
         err = ""
-        for enc in ("gbk", "utf-8", "utf-8-sig"):
+        for enc in ("gbk", "utf-8", "utf-16-le", "utf-8-sig"):
             try:
                 out = out_raw.decode(enc).strip()
                 break
@@ -401,7 +451,7 @@ def run_vbs_text(vbs_code: str, timeout: float = 22.0) -> str:
                 continue
         if not out and out_raw:
             out = out_raw.decode("gbk", errors="replace").strip()
-        for enc in ("gbk", "utf-8", "utf-8-sig"):
+        for enc in ("gbk", "utf-8", "utf-16-le", "utf-8-sig"):
             try:
                 err = err_raw.decode(enc).strip()
                 break
@@ -424,6 +474,20 @@ def run_vbs_text(vbs_code: str, timeout: float = 22.0) -> str:
                 pass
 
 
+_SW_AI_SYSTEM_PROMPT = (
+    "Output ONLY concise SolidWorks 2025 VBScript inside ```vbscript```. No Option Explicit, no prose. "
+    "VBScript Rules:\n"
+    "1. Pure VBScript: NEVER write 'As Object', 'As Long', 'As Double', 'As Boolean' (variables have NO types in VBScript).\n"
+    "2. NEVER write 'Sub main()' or 'End Sub'. Write top-level sequential statements directly.\n"
+    "3. Use GlamConnectSw() and GlamEnsurePart(swApp):\n"
+    "   Dim swApp, model, feat: Set swApp = GlamConnectSw(): If swApp Is Nothing Then WScript.Quit 1: End If: Set model = GlamEnsurePart(swApp): GlamSelectPlane model, \"front\"\n"
+    "4. Units MUST be meters (mm/1000). Avoid single-line If..Then with colons for multi-statements.\n"
+    "5. Sub calls with parentheses require Call: e.g. Call model.ShowNamedView2(\"\", 7) or omit parens: model.ShowNamedView2 \"\", 7.\n"
+    "6. Boss extrude uses 23 args: model.FeatureManager.FeatureExtrusion2(True,False,False,0,0,dM,0,False,False,False,False,0,0,False,False,False,False,True,True,True,0,0,False).\n"
+    "End with: model.ForceRebuild3 False: model.ShowNamedView2 \"\", 7: model.ViewZoomtofit2: WScript.Echo \"OK:已完成建模\"."
+)
+
+
 def _extract_and_clean_vbs(raw: str) -> str:
     txt = (raw or "").replace("\ufeff", "").replace("\u200b", "").replace("\u00a0", " ").replace("\r\n", "\n").strip()
     blocks = re.findall(r"```[a-zA-Z0-9_-]*\s*\n(.*?)```", txt, flags=re.DOTALL)
@@ -442,7 +506,7 @@ def _extract_and_clean_vbs(raw: str) -> str:
     txt = txt.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
     lines = txt.splitlines()
     vbs_start_re = re.compile(
-        r"^\s*(?:Option\s+|Const\s+|Dim\s+|On\s+Error\b|Set\s+|Function\s+|Sub\s+|For\s+|If\s+|WScript\.|swApp\.|model\.|Rem\b|')",
+        r"^\s*(?:Option\s+|Const\s+|Dim\s+|On\s+Error\b|Set\s+|Function\s+|Sub\s+|For\s+|If\s+|WScript\.|swApp\.|model\.|Part\.|Rem\b|')",
         flags=re.IGNORECASE,
     )
     start_idx = 0
@@ -460,7 +524,18 @@ def _extract_and_clean_vbs(raw: str) -> str:
     cleaned = "\n".join(kept).strip()
     if not cleaned:
         raise ValueError("AI 生成的 VBScript 内容为空")
+    # Clean VBA typed declarations: "Dim x As Object" -> "Dim x" (only known VBA/SolidWorks types)
+    cleaned = re.sub(
+        r"\bAs\s+(?:Object|Long|Integer|Double|Single|Boolean|String|Variant|Byte|Date|SldWorks\.[a-zA-Z0-9_]+|ModelDoc2|PartDoc|SketchManager|FeatureManager|Feature|Body2|Face2|Edge|Entity)\b",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    # Translate Application.SldWorks -> GlamConnectSw()
     cleaned = re.sub(r"\bApplication\.SldWorks\b", "GlamConnectSw()", cleaned, flags=re.IGNORECASE)
+    # Strip Sub main() and End Sub
+    cleaned = re.sub(r"(?im)^\s*Sub\s+main\s*\(\s*\)\s*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*End\s+Sub\s*$", "", cleaned)
     if re.search(r"^\s*(?:Sub|Function)\s+(?:AutoConnectSw|ConnectSolidWorks|SelectPlaneSafe|EnsureActivePart)\b", cleaned, flags=re.IGNORECASE | re.MULTILINE):
         cleaned = re.sub(
             r"(?is)^\s*(?:Sub|Function)\s+(?:AutoConnectSw|ConnectSolidWorks|SelectPlaneSafe|EnsureActivePart)\b.*?^\s*End\s+(?:Sub|Function)\s*$",
@@ -468,6 +543,7 @@ def _extract_and_clean_vbs(raw: str) -> str:
             cleaned,
             flags=re.MULTILINE,
         ).strip()
+    cleaned = cleaned.strip()
     if "GlamConnectSw" not in cleaned and "AutoConnectSw" not in cleaned and "ConnectSolidWorks" not in cleaned and "GetObject" not in cleaned and "CreateObject" not in cleaned:
         cleaned = (
             "Dim swApp, model\n"
@@ -479,25 +555,23 @@ def _extract_and_clean_vbs(raw: str) -> str:
     return cleaned
 
 
-_SW_AI_SYSTEM_PROMPT = (
-    "Output ONLY SolidWorks 2025 VBScript inside ```vbscript```. No Option Explicit, no prose. "
-    "Call built-in globals (never redefine them, never use Application.SldWorks): "
-    "Dim swApp,model,feat: Set swApp=GlamConnectSw(): If swApp Is Nothing Then WScript.Quit 1: End If: "
-    "Set model=GlamEnsurePart(swApp): GlamSelectPlane model,\"front\". "
-    "Units MUST be meters (mm/1000). Avoid single-line If..Then with colons for multi-statements. "
-    "Boss extrude uses 23 args: model.FeatureManager.FeatureExtrusion2(True,False,False,0,0,dM,0,False,False,False,False,0,0,False,False,False,False,True,True,True,0,0,False). "
-    "End with: model.ForceRebuild3 False: model.ShowNamedView2 \"\",7: model.ViewZoomtofit2: WScript.Echo \"OK:已完成建模\"."
-)
-
-
 def execute_solidworks_action(
     args: Dict[str, Any],
     ai_cfg: Optional[Dict[str, Any]] = None,
     log_cb: Optional[Callable[[str, str], None]] = None,
 ) -> str:
-    act = str(args.get("action") or "get_status").strip().lower()
+    cleaned_args = _clean_args(args)
+    act = str(cleaned_args.get("action") or "get_status").strip().lower()
+
+    # Automatically launch SolidWorks GUI if not running
+    if act in ("open", "launch", "start", "new_part", "create_box", "create_cylinder", "create_tube", "view", "rebuild", "save", "export", "ai_model"):
+        if not _is_sldworks_running():
+            if log_cb:
+                log_cb("[SolidWorks] 检测到 SolidWorks 未启动，正在自动为您启动...", "cmd")
+            _launch_solidworks_app()
+
     if act == "ai_model":
-        goal = str(args.get("goal") or args.get("target") or args.get("extra") or "").strip()
+        goal = str(cleaned_args.get("goal") or cleaned_args.get("target") or cleaned_args.get("extra") or "").strip()
         if not goal:
             raise ValueError("缺少 SolidWorks AI 建模需求描述 goal")
         cfg = dict(ai_cfg or {})
@@ -522,34 +596,16 @@ def execute_solidworks_action(
             system_prompt=_SW_AI_SYSTEM_PROMPT,
             user_text=f"Create concise SolidWorks VBScript: {goal}",
             image_b64=None,
-            max_tokens=1400,
-            timeout=25.0,
+            max_tokens=850,
+            timeout=10.0,
             allow_reasoning_fallback=False,
         )
         user_vbs = _extract_and_clean_vbs(raw)
         vbs = auto_hdr + "\n" + user_vbs
-        try:
-            return run_vbs_text(vbs, timeout=35.0)
-        except Exception as exc:
-            err_msg = str(exc)
-            if "VBScript" in err_msg or "错误" in err_msg or "cscript" in err_msg:
-                if log_cb:
-                    log_cb(f"[SolidWorks AI] 脚本报错，自动自愈重写一次: {err_msg[:90]}", "warn")
-                repair_raw = _call_chat_api(
-                    cfg,
-                    system_prompt=_SW_AI_SYSTEM_PROMPT,
-                    user_text=f"Fix VBScript error:\n{err_msg}\n\nCode:\n{user_vbs[:1800]}\n\nGoal: {goal}",
-                    image_b64=None,
-                    max_tokens=1400,
-                    timeout=25.0,
-                    allow_reasoning_fallback=False,
-                )
-                vbs2 = auto_hdr + "\n" + _extract_and_clean_vbs(repair_raw)
-                return run_vbs_text(vbs2, timeout=35.0)
-            raise
+        return run_vbs_text(vbs, timeout=12.0)
 
-    vbs, move_info = build_sw_vbs_script(act, args)
-    res = run_vbs_text(vbs, timeout=35.0)
+    vbs, move_info = build_sw_vbs_script(act, cleaned_args)
+    res = run_vbs_text(vbs, timeout=15.0)
     if move_info:
         src = move_info["tmp_out"]
         dst = move_info["dest_out"]

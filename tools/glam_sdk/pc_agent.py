@@ -1888,7 +1888,7 @@ class PcToolExecutor:
                 done_evt.set()
 
         threading.Thread(target=_sw_worker, daemon=True).start()
-        if done_evt.wait(timeout=16.0):
+        if done_evt.wait(timeout=13.0):
             if "err" in holder:
                 raise RuntimeError(holder["err"])
             return holder.get("res") or "已完成 SolidWorks AI 建模"

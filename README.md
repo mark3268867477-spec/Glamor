@@ -4,6 +4,7 @@
   <b>Official Zero-Environment PC Controller, C/ELF App SDK, ABI Preflight Auditor &amp; <code>.gla</code> Packager</b><br>
   <b>G'lam OS 官方零环境开发控制器 · C/ELF 动态应用 SDK · PC 端 17 符号 ABI 静态体检 · <code>.gla</code> 打包与热装机工作台</b><br><br>
   <a href="#english-developer-guide">English Developer Guide</a> &nbsp;|&nbsp; <a href="#中文开发者手册">中文开发者手册</a> &nbsp;|&nbsp;
+  <a href="CHANGELOG.md">Changelog / 更新日志</a> &nbsp;|&nbsp;
   <a href="https://github.com/mark3268867477-spec/Glam-OS">Companion OS Kernel Repository (Glam-OS)</a>
 </p>
 
